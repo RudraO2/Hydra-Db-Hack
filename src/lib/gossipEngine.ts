@@ -1,5 +1,5 @@
 import { NPC_BY_ID, type NPCId } from '@/data/npcs';
-import { ingestNPCMemory, ingestWorldEvent, recallForNPC } from './hydradb';
+import { ingestGossipMemory, ingestHiveGossip, recallForGossip } from './hydradb';
 import { callLLM, type Message } from './userServices';
 
 export type GossipSession = {
@@ -97,9 +97,13 @@ export async function runGossipExchange(
   const npc1 = NPC_BY_ID[npc1Id];
   const npc2 = NPC_BY_ID[npc2Id];
 
+  // Use enriched recall (thinking mode + search_forceful_relations).
+  // HydraDB follows graph edges so each NPC can surface memories from connected
+  // NPCs — e.g. Priya's recall about Sanjana will find what Meera witnessed,
+  // because the graph links them. This is the actual gossip propagation mechanism.
   const [recall1, recall2] = await Promise.all([
-    recallForNPC(npc1Id, 'most interesting thing I know around the office').catch(() => ''),
-    recallForNPC(npc2Id, 'what I know about recent office chatter').catch(() => '')
+    recallForGossip(npc1Id, 'most interesting thing I know around the office').catch(() => ''),
+    recallForGossip(npc2Id, 'what I know about recent office chatter').catch(() => '')
   ]);
 
   const topic = firstMeaningfulPhrase(recall1 || recall2 || `${npc1.name} and ${npc2.name} trading office gossip`);
@@ -148,23 +152,16 @@ export async function runGossipExchange(
     `${npc1.name}: ${turn3Text}`
   ].join(' ');
 
+  // Ingest with TTL so old gossip decays — NPCs don't obsess over stale chatter.
+  // Gossip goes into both NPCs' personal memories AND the shared hive, so any NPC
+  // recalling later can discover what was said, not just the two who were there.
   await Promise.allSettled([
-    ingestNPCMemory(npc1Id, summary, gameTime),
-    ingestNPCMemory(npc2Id, summary, gameTime),
-    ingestNPCMemory(npc1Id, exactTranscript, gameTime),
-    ingestNPCMemory(npc2Id, exactTranscript, gameTime),
-    ingestWorldEvent({
-      description: summary,
-      entities: [npc1Id, npc2Id],
-      location,
-      gameTime
-    }),
-    ingestWorldEvent({
-      description: exactTranscript,
-      entities: [npc1Id, npc2Id],
-      location,
-      gameTime
-    })
+    ingestGossipMemory(npc1Id, summary, gameTime),
+    ingestGossipMemory(npc2Id, summary, gameTime),
+    ingestGossipMemory(npc1Id, exactTranscript, gameTime),
+    ingestGossipMemory(npc2Id, exactTranscript, gameTime),
+    ingestHiveGossip({ description: summary, entities: [npc1Id, npc2Id], location, gameTime }),
+    ingestHiveGossip({ description: exactTranscript, entities: [npc1Id, npc2Id], location, gameTime })
   ]);
 
   return {

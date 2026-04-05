@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
+import { CutsceneScene } from '@/game/CutsceneScene';
 import { OfficeScene } from '@/game/OfficeScene';
 
 type NPCBehaviorConfig = {
@@ -40,7 +41,8 @@ export default function PhaserGame({
       const Phaser = (await import('phaser')).default;
       if (disposed || !hostRef.current) return;
 
-      const scene = new OfficeScene({
+      const cutsceneScene = new CutsceneScene();
+      const officeScene = new OfficeScene({
         onInteract: (npcId: string) => {
           onInteractRef.current?.(npcId);
           onInteractNpcRef.current?.(npcId, null);
@@ -64,7 +66,8 @@ export default function PhaserGame({
             debug: false
           }
         },
-        scene: [scene],
+        // CutsceneScene runs first; it calls scene.start('OfficeScene') when done
+        scene: [cutsceneScene, officeScene],
         scale: {
           mode: Phaser.Scale.RESIZE,
           autoCenter: Phaser.Scale.CENTER_BOTH

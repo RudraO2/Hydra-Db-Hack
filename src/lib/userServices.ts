@@ -141,7 +141,10 @@ export async function callLLM(system: string, messages: Message[]): Promise<stri
 let _activeSource: AudioBufferSourceNode | null = null;
 let _activeCtx: AudioContext | null = null;
 
-export async function speak(text: string, config: { npcId?: string } = {}): Promise<void> {
+export async function speak(
+  text: string,
+  config: { npcId?: string; onPlayStart?: () => void } = {}
+): Promise<void> {
   // Cancel whatever is currently playing.
   try { _activeSource?.stop(); } catch { /* already stopped */ }
   try { await _activeCtx?.close(); } catch { /* already closed */ }
@@ -154,7 +157,11 @@ export async function speak(text: string, config: { npcId?: string } = {}): Prom
     body: JSON.stringify({ text, npcId: config.npcId }),
   });
 
-  if (!res.ok) return; // TTS server not running — fail silently.
+  if (!res.ok) {
+    const msg = await res.json().catch(() => ({}));
+    console.error('[TTS] failed:', msg);
+    return;
+  }
 
   const buffer = await res.arrayBuffer();
   const ctx = new AudioContext();
@@ -164,6 +171,8 @@ export async function speak(text: string, config: { npcId?: string } = {}): Prom
   _activeSource = source;
   source.buffer = decoded;
   source.connect(ctx.destination);
+  // Fire callback synchronously before audio starts so lip sync begins at the same frame.
+  config.onPlayStart?.();
   source.start();
 }
 

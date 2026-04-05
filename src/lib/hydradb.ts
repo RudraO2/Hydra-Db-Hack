@@ -15,6 +15,9 @@ const PLAYER_CHAT_MEMORY_ID = 'player_chat_memory_v1';
 const MAX_MEMORY_INGESTION_CHARS = 100_000;
 const MAX_MESSAGE_CHARS = 4_000;
 
+// Gossip memories expire after 8 real minutes — natural information decay
+const GOSSIP_MEMORY_TTL_SECONDS = 480;
+
 const client = new HydraClient({ token: process.env.HYDRADB_API_KEY });
 
 export type WorldEvent = {
@@ -45,6 +48,23 @@ type PersistedChatTranscript = {
   messages: PersistedChatMessage[];
 };
 
+// What each NPC should focus on when their memories are processed by inference.
+// Passed as custom_instructions to addMemory — shapes what HydraDB extracts.
+const NPC_MEMORY_INSTRUCTIONS: Record<NPCId, string> = {
+  kabir:
+    'Remember threats to company finances, mentions of the USB drive, and any signs of disloyalty. Prioritise crisis-level details over small talk.',
+  priya:
+    'Remember everything about everyone. Prioritise emotional drama, interpersonal dynamics, and any unusual behaviour observed in colleagues.',
+  dev:
+    'Remember technical details: server access events, CCTV status, network anomalies, and any IT tickets. Note anything that seemed like a glitch.',
+  meera:
+    'Remember financial irregularities, suspicious colleague behaviour, and overheard conversations. Ignore pleasantries.',
+  sanjana:
+    'Note the exact questions the investigator asked. Log which topics seem to interest them. Remember what you have already deflected.',
+  rohan:
+    'Remember anything visually out of place. Focus on times, objects, and locations. Note who was where and what they were carrying.'
+};
+
 const DEFAULT_INVESTIGATION_STATE: InvestigationState = {
   npcIdsTalkedTo: [],
   cluesFound: []
@@ -63,6 +83,11 @@ const NAME_TO_NPC_ID: Record<string, NPCId> = {
   'sanjana kapoor': 'sanjana',
   rohan: 'rohan',
   'rohan mehta': 'rohan'
+};
+
+type MemoryIngestionOptions = {
+  expiryTime?: number;
+  documentMetadata?: Record<string, unknown>;
 };
 
 function formatGameTime(gameMinute: number) {
@@ -211,6 +236,28 @@ function joinUniqueTexts(payload: unknown) {
   return [...new Set(extractText(payload).map((text) => text.trim()).filter(Boolean))].join('\n');
 }
 
+// Extract human-readable relationship summaries from HydraDB graph_context.
+// ScoredPathResponse.combined_context is the pre-formatted text describing
+// entity paths (e.g. "Sanjana → CARRIED → [silver object] → FROM → CEO Office").
+function extractGraphContext(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const record = payload as Record<string, unknown>;
+  const gc = record.graph_context;
+  if (!gc || typeof gc !== 'object') return [];
+
+  const graphCtx = gc as {
+    query_paths?: Array<{ combined_context?: string }>;
+    chunk_relations?: Array<{ combined_context?: string }>;
+  };
+
+  return [
+    ...(graphCtx.query_paths ?? []),
+    ...(graphCtx.chunk_relations ?? [])
+  ]
+    .map((p) => p.combined_context)
+    .filter((ctx): ctx is string => Boolean(ctx && ctx.trim()));
+}
+
 function extractMemoryEntries(payload: unknown) {
   if (!payload || typeof payload !== 'object') return [];
 
@@ -255,7 +302,13 @@ async function ensureTenant() {
   }
 }
 
-async function addMemory(subTenantId: string, text: string, infer: boolean, sourceId?: string) {
+async function addMemory(
+  subTenantId: string,
+  text: string,
+  infer: boolean,
+  sourceId?: string,
+  options?: MemoryIngestionOptions
+) {
   await ensureTenant();
   await client.upload.addMemory({
     tenant_id: TENANT,
@@ -265,7 +318,11 @@ async function addMemory(subTenantId: string, text: string, infer: boolean, sour
       {
         source_id: sourceId,
         text: truncateForIngestion(text),
-        infer
+        infer,
+        ...(options?.expiryTime != null && { expiry_time: options.expiryTime }),
+        ...(options?.documentMetadata != null && {
+          document_metadata: JSON.stringify(options.documentMetadata)
+        })
       }
     ]
   });
@@ -274,7 +331,8 @@ async function addMemory(subTenantId: string, text: string, infer: boolean, sour
 async function addConversationMemory(
   subTenantId: string,
   pairs: Array<{ user: string; assistant: string }>,
-  sourceId: string
+  sourceId: string,
+  customInstructions?: string
 ) {
   if (pairs.length === 0) return;
 
@@ -289,6 +347,7 @@ async function addConversationMemory(
         user_name: 'Player',
         infer: true,
         custom_instructions:
+          customInstructions ??
           'Remember stable facts from this dialogue, what the NPC said, what the NPC heard, and keep future recall truthful to the stored conversation.',
         user_assistant_pairs: pairs
       }
@@ -309,7 +368,17 @@ async function fetchMemoryById(subTenantId: string, sourceId: string): Promise<s
   return joined || null;
 }
 
-async function recallText(subTenantId: string, query: string): Promise<string> {
+// Core recall — shared by all recall variants.
+// graph_context: true always — HydraDB auto-extracts entity relationships and
+// surfaces them as combined_context strings alongside the semantic results.
+// enriched: true switches to "thinking" mode and enables search_forceful_relations,
+// which follows graph edges to surface memories from connected NPCs — this is the
+// mechanism that makes gossip actually propagate knowledge across agents.
+async function recallText(
+  subTenantId: string,
+  query: string,
+  options: { additionalContext?: string; enriched?: boolean } = {}
+): Promise<string> {
   await ensureTenant();
 
   const payload = await client.recall.recallPreferences({
@@ -318,7 +387,33 @@ async function recallText(subTenantId: string, query: string): Promise<string> {
     query,
     recency_bias: 0.7,
     alpha: 0.6,
-    max_results: 8
+    max_results: 8,
+    graph_context: true,
+    ...(options.additionalContext && { additional_context: options.additionalContext }),
+    ...(options.enriched && { mode: 'thinking', search_forceful_relations: true })
+  });
+
+  const textLines = joinUniqueTexts(payload);
+  const graphLines = extractGraphContext(payload).join('\n');
+  return [textLines, graphLines].filter(Boolean).join('\n');
+}
+
+// Exact-match recall using HydraDB's boolean/lexical search.
+// Use this alongside semantic recall for clue keywords to prevent drift.
+async function recallLexical(
+  subTenantId: string,
+  query: string,
+  operator: 'or' | 'and' | 'phrase' = 'or'
+): Promise<string> {
+  await ensureTenant();
+
+  const payload = await client.recall.booleanRecall({
+    tenant_id: TENANT,
+    sub_tenant_id: subTenantId,
+    query,
+    operator,
+    search_mode: 'memories',
+    max_results: 6
   });
 
   return joinUniqueTexts(payload);
@@ -359,12 +454,50 @@ function parsePersistedTranscript(text: string | null, npcId: NPCId): PersistedC
   }
 }
 
+// ─── Public API ──────────────────────────────────────────────────────────────
+
 export async function ingestWorldEvent(event: WorldEvent): Promise<void> {
-  await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(event), true);
+  await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(event), true, undefined, {
+    documentMetadata: {
+      eventType: 'world_event',
+      location: event.location,
+      gameTime: event.gameTime,
+      isClue: event.isClue ?? false,
+      clueId: event.clueId ?? null,
+      entities: event.entities
+    }
+  });
 }
 
 export async function ingestNPCMemory(npcId: string, content: string, gameTime: string): Promise<void> {
-  await addMemory(npcId, serializeNpcMemory(content, gameTime), true);
+  await addMemory(npcId, serializeNpcMemory(content, gameTime), true, undefined, {
+    documentMetadata: { eventType: 'npc_memory', gameTime, npcId }
+  });
+}
+
+// Gossip memories have a TTL so old chatter decays naturally.
+// Uses enriched ingest so HydraDB builds richer graph edges from the exchange.
+export async function ingestGossipMemory(
+  npcId: NPCId,
+  content: string,
+  gameTime: string
+): Promise<void> {
+  await addMemory(npcId, serializeNpcMemory(content, gameTime), true, undefined, {
+    expiryTime: GOSSIP_MEMORY_TTL_SECONDS,
+    documentMetadata: { eventType: 'gossip', gameTime, npcId }
+  });
+}
+
+export async function ingestHiveGossip(event: WorldEvent): Promise<void> {
+  await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(event), true, undefined, {
+    expiryTime: GOSSIP_MEMORY_TTL_SECONDS,
+    documentMetadata: {
+      eventType: 'gossip',
+      location: event.location,
+      gameTime: event.gameTime,
+      entities: event.entities
+    }
+  });
 }
 
 export async function recallForNPC(npcId: string, query: string): Promise<string> {
@@ -390,10 +523,18 @@ export async function seedBackstory(): Promise<void> {
       gameTime: '09:00'
     };
 
-    await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(worldEvent), false);
+    await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(worldEvent), false, undefined, {
+      documentMetadata: {
+        eventType: 'backstory',
+        gameTime: '09:00',
+        entities: event.entities
+      }
+    });
 
     for (const npcId of toNpcIds(event.entities)) {
-      await addMemory(npcId, serializeNpcMemory(event.text, '09:00'), false);
+      await addMemory(npcId, serializeNpcMemory(event.text, '09:00'), false, undefined, {
+        documentMetadata: { eventType: 'backstory', gameTime: '09:00', npcId }
+      });
     }
   }
 
@@ -405,7 +546,15 @@ export async function ensureBackstorySeeded() {
 }
 
 export async function ingestHiveEvent(event: WorldEvent, infer = true) {
-  await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(event), infer);
+  await addMemory(HIVE_SUB_TENANT, serializeWorldEvent(event), infer, undefined, {
+    documentMetadata: {
+      eventType: 'world_event',
+      location: event.location,
+      gameTime: event.gameTime,
+      isClue: event.isClue ?? false,
+      clueId: event.clueId ?? null
+    }
+  });
 }
 
 export async function ingestPersonalMemory(
@@ -414,16 +563,45 @@ export async function ingestPersonalMemory(
   gameMinute: number,
   infer = true
 ) {
-  await addMemory(npcId, serializeNpcMemory(content, formatGameTime(gameMinute)), infer);
+  await addMemory(npcId, serializeNpcMemory(content, formatGameTime(gameMinute)), infer, undefined, {
+    documentMetadata: {
+      eventType: 'npc_memory',
+      gameTime: formatGameTime(gameMinute),
+      npcId
+    }
+  });
 }
 
-export async function recallHive(query: string) {
-  const joined = await recallWorldState(query);
+// Standard semantic recall — used for player↔NPC chat.
+// additionalContext injects live game state (time, location, clues found) to
+// bias what HydraDB surfaces — NPCs remember things relevant to right now.
+export async function recallHive(query: string, additionalContext?: string) {
+  const joined = await recallText(HIVE_SUB_TENANT, query, { additionalContext });
   return joined ? joined.split('\n').filter(Boolean) : [];
 }
 
-export async function recallNpcMemory(npcId: NPCId, query: string) {
-  const joined = await recallForNPC(npcId, query);
+export async function recallNpcMemory(npcId: NPCId, query: string, additionalContext?: string) {
+  const joined = await recallText(npcId, query, { additionalContext });
+  return joined ? joined.split('\n').filter(Boolean) : [];
+}
+
+// Enriched recall for the gossip engine — "thinking" mode + search_forceful_relations.
+// This follows graph edges so NPC B can surface NPC A's memories through their
+// shared connections. This is what makes gossip propagate as real knowledge transfer.
+export async function recallForGossip(npcId: NPCId, query: string): Promise<string> {
+  return recallText(npcId, query, { enriched: true });
+}
+
+export async function recallHiveForGossip(query: string): Promise<string> {
+  return recallText(HIVE_SUB_TENANT, query, { enriched: true });
+}
+
+// Lexical recall on the hive — exact keyword matching for clue-related terms.
+// Run in parallel with semantic recall; merge results to prevent semantic drift
+// from causing the player to miss a clue because they phrased it differently.
+export async function recallHiveLexical(keywords: string[]): Promise<string[]> {
+  if (keywords.length === 0) return [];
+  const joined = await recallLexical(HIVE_SUB_TENANT, keywords.join(' '), 'or');
   return joined ? joined.split('\n').filter(Boolean) : [];
 }
 
@@ -443,7 +621,12 @@ export async function savePlayerConversation(params: {
       false,
       PLAYER_CHAT_TRANSCRIPT_ID
     ),
-    addConversationMemory(params.npcId, pairs, PLAYER_CHAT_MEMORY_ID)
+    addConversationMemory(
+      params.npcId,
+      pairs,
+      PLAYER_CHAT_MEMORY_ID,
+      NPC_MEMORY_INSTRUCTIONS[params.npcId]
+    )
   ]);
 }
 
@@ -532,4 +715,23 @@ export function behaviorFlagsFromState(state: InvestigationState) {
     sanjanaToEntrance: state.cluesFound.length >= 5,
     devAvoidPlayer: state.cluesFound.includes('clue_1') || state.cluesFound.includes('clue_2')
   };
+}
+
+// Fetch all graph relations HydraDB has built for an NPC from their memories.
+// Returns entity triplets with evidence — useful for populating an evidence board
+// or verifying what the graph knows about a suspect.
+export async function fetchNpcGraphRelations(npcId: NPCId, limit = 30) {
+  await ensureTenant();
+  try {
+    const payload = await client.fetch.graphRelationsBySourceId({
+      tenant_id: TENANT,
+      sub_tenant_id: npcId,
+      source_id: npcId,
+      is_memory: true,
+      limit
+    });
+    return (payload.relations ?? []).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
