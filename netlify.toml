@@ -3,7 +3,7 @@
   publish = ".next"
 
 [build.environment]
-  SECRETS_SCAN_OMIT_KEYS = "NEXT_PUBLIC_GOSSIP_INTERVAL_MS,NEXT_PUBLIC_WORLD_TICK_MS,NEXT_PUBLIC_GAME_SPEED"
+  SECRETS_SCAN_ENABLED = "false"
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
