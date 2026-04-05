@@ -1,5 +1,7 @@
 # Office Drama - The Stolen Drive
 
+Live: https://officedrama1.netlify.app/game
+
 HydraDB-powered NPC investigation game built with Next.js 14 (App Router), Phaser 3, and VRM rendering.
 
 ## Setup
