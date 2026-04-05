@@ -2,5 +2,8 @@
   command = "npm run build"
   publish = ".next"
 
+[build.environment]
+  SECRETS_SCAN_OMIT_KEYS = "NEXT_PUBLIC_GOSSIP_INTERVAL_MS,NEXT_PUBLIC_WORLD_TICK_MS,NEXT_PUBLIC_GAME_SPEED"
+
 [[plugins]]
   package = "@netlify/plugin-nextjs"
