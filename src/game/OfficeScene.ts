@@ -230,6 +230,9 @@ export class OfficeScene extends Phaser.Scene {
       this.scheduleNextWaypoint(state);
     }
 
+    // Fade in smoothly from CutsceneScene (or on fresh load)
+    this.cameras.main.fadeIn(500, 0, 0, 0);
+
     this.time.addEvent({
       delay: 1000,
       loop: true,

@@ -64,6 +64,7 @@ export default function ConversationView() {
   const [isListening, setIsListening] = useState(false);
   const [draft, setDraft] = useState('');
   const [clueToast, setClueToast] = useState<string | null>(null);
+  const [speakTrigger, setSpeakTrigger] = useState(0);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -208,9 +209,13 @@ export default function ConversationView() {
       }
 
       try {
-        await userSpeak(npcText, { npcId: npc.id });
+        await userSpeak(npcText, {
+          npcId: npc.id,
+          onPlayStart: () => setSpeakTrigger((t) => t + 1),
+        });
       } catch {
-        // TTS is optional.
+        // TTS is optional — still animate lips as a fallback.
+        setSpeakTrigger((t) => t + 1);
       }
     } catch {
       setMessages((prev) => [
@@ -277,7 +282,10 @@ export default function ConversationView() {
           const isTyping = tag === 'input' || tag === 'textarea' || tag === 'select';
           if (!isTyping && latestNPCText && !isLoading) {
             event.preventDefault();
-            void userSpeak(latestNPCText, { npcId: npc.id }).catch(() => {});
+            void userSpeak(latestNPCText, {
+            npcId: npc.id,
+            onPlayStart: () => setSpeakTrigger((t) => t + 1),
+          }).catch(() => { setSpeakTrigger((t) => t + 1); });
           }
         }
       }}
@@ -322,6 +330,7 @@ export default function ConversationView() {
           emotion={currentEmotion}
           speechText={latestNPCText}
           isThinking={isLoading}
+          speakTrigger={speakTrigger}
         />
       </div>
 

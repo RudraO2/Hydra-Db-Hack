@@ -8,6 +8,7 @@ import {
   getPlayerConversationHistory,
   ingestHiveEvent,
   recallHive,
+  recallHiveLexical,
   recallNpcMemory,
   savePlayerConversation,
   setInvestigationState,
@@ -175,6 +176,40 @@ function extractKnowledgeLinks(npcId: NPCId, worldContextLines: string[]): Knowl
   return links.slice(0, 3);
 }
 
+// Keywords that map directly onto clue trigger words — if the player's message
+// contains any of these, run a lexical recall alongside the semantic one so
+// we never miss a clue mention due to embedding-space drift.
+const CLUE_TRIGGER_WORDS = [
+  'cctv', 'camera', 'security', 'footage', 'recording',
+  'server', 'logs', 'access', 'remote', 'network', 'computer',
+  'sanjana', 'phone', 'call', 'morning', 'early', 'heard',
+  'kabir', 'office', 'silver', 'usb', 'carrying', 'saw',
+  'whistleblower', 'hr', 'protection', 'legal', 'rights', 'policy'
+];
+
+function extractClueKeywords(text: string): string[] {
+  const lowered = text.toLowerCase();
+  return CLUE_TRIGGER_WORDS.filter((kw) => lowered.includes(kw));
+}
+
+// Inject live game state into every recall so HydraDB biases results toward
+// what is relevant right now — time, place, how far the investigation has gone.
+function buildAdditionalContext(
+  gameTime: string,
+  playerLocation: string,
+  cluesFound: string[],
+  investigationCount: number
+): string {
+  const parts = [`Game time: ${gameTime}.`, `Player is in: ${playerLocation}.`];
+  if (cluesFound.length > 0) {
+    parts.push(`Investigator has found ${cluesFound.length} clue(s): ${cluesFound.join(', ')}.`);
+  }
+  if (investigationCount > 0) {
+    parts.push(`Investigator has spoken to ${investigationCount} NPC(s) so far.`);
+  }
+  return parts.join(' ');
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as RequestBody;
@@ -190,6 +225,16 @@ export async function POST(req: Request) {
     const gameTime = body.gameTime ?? '09:00';
     const playerLocation = body.playerLocation ?? 'office';
 
+    // Build context before HydraDB calls — client already sends cluesFound and
+    // investigationState so we don't need to wait for the hive fetch.
+    const additionalContext = buildAdditionalContext(
+      gameTime,
+      playerLocation,
+      body.cluesFound ?? [],
+      body.investigationState ?? 0
+    );
+    const clueKeywords = extractClueKeywords(body.playerMessage);
+
     let npcMemoryLines: string[] = [];
     let worldContextLines: string[] = [];
     let priorConversationHistory: PersistedChatMessage[] = [];
@@ -198,8 +243,15 @@ export async function POST(req: Request) {
 
     try {
       await ensureBackstorySeeded();
-      npcMemoryLines = await recallNpcMemory(body.npcId, body.playerMessage);
-      worldContextLines = await recallHive(body.playerMessage);
+      npcMemoryLines = await recallNpcMemory(body.npcId, body.playerMessage, additionalContext);
+      worldContextLines = await recallHive(body.playerMessage, additionalContext);
+
+      // Lexical recall runs in parallel when the player mentions clue-related words.
+      // Results are prepended so exact matches rank ahead of semantic approximations.
+      if (clueKeywords.length > 0) {
+        const lexicalLines = await recallHiveLexical(clueKeywords).catch(() => []);
+        worldContextLines = uniqueLines([...lexicalLines, ...worldContextLines]);
+      }
       priorConversationHistory = await getPlayerConversationHistory(body.npcId);
       investigationFromHive = await getInvestigationState();
 

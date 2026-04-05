@@ -185,15 +185,19 @@ export default function VRMViewer({ npcId, emotion, speechText = '', isThinking 
         const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
         const verticalDistance = frameHeight / (2 * Math.tan(verticalFov / 2));
         const horizontalDistance = frameWidth / (2 * Math.tan(horizontalFov / 2));
-        const focusYValue = THREE.MathUtils.lerp(frameBottom, frameTop, 0.62);
+        // Face-level aim: eye height is slightly below the head bone top
+        const faceFocusY = reframedHeadWorld
+          ? reframedHeadWorld.y - reframedUpperBodySpan * 0.08
+          : THREE.MathUtils.lerp(frameBottom, frameTop, 0.82);
         const cameraDistance = THREE.MathUtils.clamp(
-          Math.max(verticalDistance, horizontalDistance) * 0.9,
-          0.96,
-          1.38
+          Math.max(verticalDistance, horizontalDistance) * 0.72,
+          0.72,
+          1.05
         );
 
-        focusPoint.set(0, focusYValue + reframedUpperBodySpan * 0.02, 0.04);
-        cameraBasePosition.set(0, focusYValue - reframedUpperBodySpan * 0.03, cameraDistance);
+        // Camera sits at the same Y as the face — no upward tilt, no clipping
+        focusPoint.set(0, faceFocusY, 0.04);
+        cameraBasePosition.set(0, faceFocusY, cameraDistance);
         camera.position.copy(cameraBasePosition);
         camera.lookAt(focusPoint);
 
