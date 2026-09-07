@@ -287,7 +287,12 @@ function parseInvestigationState(text: string | null): InvestigationState {
   }
 }
 
-async function ensureTenant() {
+// The tenant only has to be created once per process. Previously every single
+// read and write called tenant.create first, which doubled the number of network
+// round trips for every HydraDB operation in the request path.
+let tenantReady: Promise<void> | null = null;
+
+async function createTenantOnce() {
   if (!process.env.HYDRADB_API_KEY) {
     throw new Error('HYDRADB_API_KEY is required to use HydraDB memory.');
   }
@@ -299,6 +304,37 @@ async function ensureTenant() {
     if (!message.includes('already')) {
       throw error;
     }
+  }
+}
+
+async function ensureTenant() {
+  if (!tenantReady) {
+    tenantReady = createTenantOnce().catch((error) => {
+      // Let the next caller retry instead of caching a permanent failure.
+      tenantReady = null;
+      throw error;
+    });
+  }
+  return tenantReady;
+}
+
+// Recall is best-effort context, never the thing the player is waiting on.
+// If HydraDB is slow we would rather answer with less context than stall the reply.
+export const RECALL_TIMEOUT_MS = Number(process.env.HYDRA_RECALL_TIMEOUT_MS ?? 4000);
+
+export async function withTimeout<T>(promise: Promise<T>, fallback: T, ms = RECALL_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      })
+    ]);
+  } catch {
+    return fallback;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -508,7 +544,21 @@ export async function recallWorldState(query: string): Promise<string> {
   return recallText(HIVE_SUB_TENANT, query);
 }
 
+let backstoryReady: Promise<void> | null = null;
+
 export async function seedBackstory(): Promise<void> {
+  // Every route used to re-check the sentinel on each request. Dedupe it per
+  // process so only the first request pays for the round trip.
+  if (!backstoryReady) {
+    backstoryReady = runSeedBackstory().catch((error) => {
+      backstoryReady = null;
+      throw error;
+    });
+  }
+  return backstoryReady;
+}
+
+async function runSeedBackstory(): Promise<void> {
   await ensureTenant();
   const alreadySeeded = await fetchMemoryById(HIVE_SUB_TENANT, BACKSTORY_SENTINEL_ID).catch(() => null);
   if (alreadySeeded) {
@@ -695,13 +745,23 @@ export async function getHydraDebugSnapshot(filterNpcIds: NPCId[] = []) {
   };
 }
 
+const INVESTIGATION_CACHE_MS = 5_000;
+let investigationCache: { value: InvestigationState; at: number } | null = null;
+
 export async function getInvestigationState(): Promise<InvestigationState> {
+  if (investigationCache && Date.now() - investigationCache.at < INVESTIGATION_CACHE_MS) {
+    return investigationCache.value;
+  }
+
   await ensureTenant();
   const raw = await fetchMemoryById(HIVE_SUB_TENANT, INVESTIGATION_STATE_ID).catch(() => null);
-  return parseInvestigationState(raw);
+  const value = parseInvestigationState(raw);
+  investigationCache = { value, at: Date.now() };
+  return value;
 }
 
 export async function setInvestigationState(state: InvestigationState) {
+  investigationCache = { value: state, at: Date.now() };
   await addMemory(
     HIVE_SUB_TENANT,
     serializeInvestigationState(state),

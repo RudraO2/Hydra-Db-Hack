@@ -2,9 +2,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { VRM, VRMHumanBoneName, VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { VRM, VRMHumanBoneName, VRMUtils } from '@pixiv/three-vrm';
 import { VRMAnimation, type Emotion } from '@/lib/VRMAnimation';
+import { cappedPixelRatio, loadVRM } from '@/lib/vrmCache';
 import { NPC_BY_ID, type NPCId } from '@/data/npcs';
 
 type Props = {
@@ -13,6 +13,21 @@ type Props = {
   speechText?: string;
   isThinking?: boolean;
 };
+
+// Each viewer parses its own copy of the model, so it also has to release the
+// GPU resources for that copy - geometries, materials and every texture on them.
+function disposeObject(object: THREE.Object3D) {
+  const mesh = object as Partial<THREE.Mesh>;
+  mesh.geometry?.dispose?.();
+
+  const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+  for (const material of materials) {
+    for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+      if (value && (value as THREE.Texture).isTexture) (value as THREE.Texture).dispose();
+    }
+    material.dispose?.();
+  }
+}
 
 export default function VRMViewer({ npcId, emotion, speechText = '', isThinking = false }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -31,8 +46,10 @@ export default function VRMViewer({ npcId, emotion, speechText = '', isThinking 
     const mount = mountRef.current;
     if (!mount) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    // Rendering at full devicePixelRatio on a 2x/3x display quadruples the pixel
+    // cost of every frame for no visible gain at this size.
+    renderer.setPixelRatio(cappedPixelRatio());
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
@@ -110,14 +127,13 @@ export default function VRMViewer({ npcId, emotion, speechText = '', isThinking 
     renderer.domElement.addEventListener('pointerleave', onPointerLeave);
     updateLookAtTarget();
 
-    const loader = new GLTFLoader();
-    loader.register((parser) => new VRMLoaderPlugin(parser));
-    loader.load(
-      modelUrl,
-      (gltf) => {
-        const vrm = gltf.userData.vrm as VRM | undefined;
-        if (!vrm) {
-          setError('missing');
+    let disposed = false;
+
+    void loadVRM(modelUrl)
+      .then((vrm) => {
+        // The viewer can unmount while a model is still in flight.
+        if (disposed) {
+          vrm.scene.traverse(disposeObject);
           return;
         }
         currentVrm = vrm;
@@ -216,13 +232,28 @@ export default function VRMViewer({ npcId, emotion, speechText = '', isThinking 
           animator.speak(speechText);
         }
         updateLookAtTarget();
-      },
-      undefined,
-      () => setError('missing')
-    );
+      })
+      .catch(() => {
+        if (!disposed) setError('missing');
+      });
+
+    // A hidden tab should not be running a 3D render loop.
+    let paused = document.hidden;
+    const onVisibilityChange = () => {
+      paused = document.hidden;
+      if (!paused) {
+        // Drop the elapsed-while-hidden delta so the avatar does not jump.
+        clock.getDelta();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     const clock = new THREE.Clock();
     const animate = () => {
+      if (paused) {
+        frame = requestAnimationFrame(animate);
+        return;
+      }
       const delta = clock.getDelta();
       const elapsed = clock.elapsedTime;
       const speechLevel = animator.getSpeechLevel();
@@ -261,16 +292,17 @@ export default function VRMViewer({ npcId, emotion, speechText = '', isThinking 
     resizeObserver.observe(mount);
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(frame);
       resizeObserver.disconnect();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
       animator.attach(null);
-      currentVrm?.scene?.traverse((obj: unknown) => {
-        const any = obj as { geometry?: { dispose?: () => void }; material?: { dispose?: () => void } };
-        any.geometry?.dispose?.();
-        any.material?.dispose?.();
-      });
+      if (currentVrm) {
+        VRMUtils.deepDispose?.(currentVrm.scene);
+        currentVrm.scene.traverse(disposeObject);
+      }
       renderer.dispose();
     };
   }, [npcId, modelUrl, animator]);

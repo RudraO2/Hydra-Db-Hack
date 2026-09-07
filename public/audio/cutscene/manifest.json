@@ -1,0 +1,66 @@
+{
+  "open_01_narrator": {
+    "file": "/audio/cutscene/open_01_narrator.mp3",
+    "durationMs": 11611
+  },
+  "open_02_sanjana": {
+    "file": "/audio/cutscene/open_02_sanjana.mp3",
+    "durationMs": 4971
+  },
+  "open_03_kabir": {
+    "file": "/audio/cutscene/open_03_kabir.mp3",
+    "durationMs": 11851
+  },
+  "open_04_kabir": {
+    "file": "/audio/cutscene/open_04_kabir.mp3",
+    "durationMs": 2451
+  },
+  "open_05_sanjana": {
+    "file": "/audio/cutscene/open_05_sanjana.mp3",
+    "durationMs": 1371
+  },
+  "open_06_sanjana": {
+    "file": "/audio/cutscene/open_06_sanjana.mp3",
+    "durationMs": 3891
+  },
+  "open_07_rohan": {
+    "file": "/audio/cutscene/open_07_rohan.mp3",
+    "durationMs": 6211
+  },
+  "open_08_dev": {
+    "file": "/audio/cutscene/open_08_dev.mp3",
+    "durationMs": 6571
+  },
+  "open_09_meera": {
+    "file": "/audio/cutscene/open_09_meera.mp3",
+    "durationMs": 8211
+  },
+  "open_10_narrator": {
+    "file": "/audio/cutscene/open_10_narrator.mp3",
+    "durationMs": 13931
+  },
+  "end_caught_01_sanjana": {
+    "file": "/audio/cutscene/end_caught_01_sanjana.mp3",
+    "durationMs": 16491
+  },
+  "end_caught_02_narrator": {
+    "file": "/audio/cutscene/end_caught_02_narrator.mp3",
+    "durationMs": 9771
+  },
+  "end_escaped_01_sanjana": {
+    "file": "/audio/cutscene/end_escaped_01_sanjana.mp3",
+    "durationMs": 11571
+  },
+  "end_escaped_02_narrator": {
+    "file": "/audio/cutscene/end_escaped_02_narrator.mp3",
+    "durationMs": 9691
+  },
+  "end_wrong_01_narrator": {
+    "file": "/audio/cutscene/end_wrong_01_narrator.mp3",
+    "durationMs": 10451
+  },
+  "end_wrong_02_sanjana": {
+    "file": "/audio/cutscene/end_wrong_02_sanjana.mp3",
+    "durationMs": 6331
+  }
+}

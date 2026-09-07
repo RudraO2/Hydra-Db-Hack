@@ -23,22 +23,47 @@ You play a detective. The CEO's golden pen drive is gone, and you have to work t
 
 - **One shared brain.** Every NPC's memory lives in one database (HydraDB), not in scattered local state. That is what lets knowledge move between characters instead of staying trapped in one.
 - **A gossip engine.** When characters meet, a gossip pass spreads what they know to each other, so information propagates through the social graph over the course of a day.
-- **Walk up and talk.** It is a 2D open world. Get close to someone, press **E**, and their VRM character rises into a conversation view. You can talk to them, like a call, or type.
-- **A real mystery.** The stolen-drive case is authored with suspects and threads you uncover by talking to the right people in the right order.
+- **Walk up and talk.** It is a 2D open world. Get close to someone, press **E**, and their VRM character rises into a conversation view. You can talk to them, like a call, or type. Replies stream in as they are generated, so people start answering rather than making you wait.
+- **Present evidence.** Once something is established, you can put it to someone directly instead of only asking about it. The same fact lands very differently depending on who you show it to — the person it implicates gets defensive, the person who took the drive gets charming.
+- **A voiced cold open.** The theft plays out before you get there, narrated and performed by a cast of distinct Gemini TTS voices. The camera, subtitles and cuts are timed against the real audio, not guessed delays.
+- **A case you can close.** Build a timeline, name a suspect, and cite the evidence you are standing on. A name without a timeline behind it is just an opinion, and she walks. Three endings, each with its own voiced epilogue.
 
 ## Built with
 
-Next.js 14 (App Router), Phaser 3 for the 2D world, Three.js with `@pixiv/three-vrm` for the character avatars, and HydraDB as the shared memory store. NPC chat, gossip, and world events run through server API routes so the database stays server-side.
+Next.js 14 (App Router), Phaser 3 for the 2D world, Three.js with `@pixiv/three-vrm` for the character avatars, and HydraDB as the shared memory store. NPC chat, gossip, and world events run through server API routes so the database stays server-side. Dialogue runs on Groq (`openai/gpt-oss-20b`) with Gemini as a fallback; the cutscene voices are Gemini TTS, baked to MP3 ahead of time.
 
-Notable pieces: `gossipEngine.ts` (how rumors spread), `npcBrain.ts` (how a character decides and remembers), `OfficeScene.ts` (the world), and `VRMViewer.tsx` / `ConversationView.tsx` (walking up and talking).
+Notable pieces: `gossipEngine.ts` (how rumors spread), `npcBrain.ts` (how a character decides and remembers), `OfficeScene.ts` (the world), `CutsceneScene.ts` (the voiced cold open), `CaseFile.tsx` (evidence and accusation), and `VRMViewer.tsx` / `ConversationView.tsx` (walking up and talking).
 
 ## Run it
 
 ```sh
-cp .env.example .env.local   # then fill HYDRADB_API_KEY
+cp .env.example .env.local   # then fill HYDRADB_API_KEY and GROQ_API_KEY
 npm install
 npm run dev
 ```
+
+The cutscene audio is committed, so there is nothing to generate to play it.
+
+## Scripts
+
+```sh
+# Re-record the cutscene voice track (needs GEMINI_API_KEY; resumable, skips existing clips)
+node scripts/generate-cutscene-audio.mjs
+
+# Re-encode the VRM avatars' textures to WebP (needs ffmpeg). 75 MB -> 22 MB.
+node scripts/optimize-vrm.mjs
+node scripts/verify-vrm.mjs
+```
+
+## Notes on performance
+
+A few things were making it feel heavier than it was, and are worth writing down:
+
+- Every HydraDB read and write called `tenant.create` first, which doubled the round trips on every operation. It is created once per process now.
+- The chat route ran five-plus recalls sequentially before calling the model, then waited on three writes before answering. Reads now go out in parallel with individual timeouts, and persistence happens after the reply is already on its way.
+- The gossip interval listed the game clock in its dependencies, so it was torn down and rebuilt every second and never survived long enough to fire. Gossip did not actually run.
+- The avatars were 75 MB of mostly uncompressed PNG. Now 22 MB, cached, and prefetched during idle time.
+- The tilemap built seven invisible bookkeeping layers, 14,000 tiles each, in both scenes.
 
 ## The backstory
 

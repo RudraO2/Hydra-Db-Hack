@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { NPCId } from '@/data/npcs';
 import { NPC_BY_ID } from '@/data/npcs';
-import { CLUES } from '@/data/mystery';
+import { CLUES, CLUE_BY_ID, CULPRIT } from '@/data/mystery';
 import {
   ensureBackstorySeeded,
   getInvestigationState,
@@ -12,11 +12,15 @@ import {
   recallNpcMemory,
   savePlayerConversation,
   setInvestigationState,
+  withTimeout,
   type InvestigationState,
   type PersistedChatMessage
 } from '@/lib/hydradb';
 import { behaviorInstruction } from '@/lib/npcBrain';
-import { callLLM, type Message as LLMMessage } from '@/lib/userServices';
+import { callLLM, streamLLM, type Message as LLMMessage } from '@/lib/userServices';
+
+// Server-sent events separate frames with a blank line.
+const SSE_FRAME_END = String.fromCharCode(10, 10);
 
 type ClientMessage = { role: 'npc' | 'player'; text: string };
 
@@ -28,6 +32,9 @@ type RequestBody = {
   investigationState?: number;
   cluesFound?: string[];
   playerLocation?: string;
+  stream?: boolean;
+  /** Id of a clue the player is putting to this character directly. */
+  presentedClue?: string;
 };
 
 type KnowledgeLink = {
@@ -54,6 +61,12 @@ function detectEmotion(text: string): Emotion {
   return 'neutral';
 }
 
+/**
+ * A clue counts as revealed only when the right character actually says the
+ * substance of it. Keyword matching alone was far too loose - words like
+ * "office" or "morning" appear in almost any reply, so clues unlocked
+ * themselves without the character ever giving anything away.
+ */
 function detectClueInReply(params: {
   npcId: NPCId;
   replyText: string;
@@ -63,9 +76,12 @@ function detectClueInReply(params: {
   for (const clue of CLUES) {
     if (clue.revealedBy !== params.npcId) continue;
     if (params.alreadyFound.includes(clue.id)) continue;
-    if (clue.triggerKeywords.some((keyword) => lowered.includes(keyword.toLowerCase()))) {
-      return clue.id;
-    }
+
+    const mentionsTopic = clue.triggerKeywords.some((keyword) => lowered.includes(keyword.toLowerCase()));
+    if (!mentionsTopic) continue;
+    if (!clue.confirm.test(params.replyText)) continue;
+
+    return clue.id;
   }
   return null;
 }
@@ -84,6 +100,46 @@ function buildBehaviorAddendum(
   return behaviorInstruction(npcId, synthetic);
 }
 
+/**
+ * Instruction injected when the player puts a specific piece of evidence to a
+ * character. This is the detective verb the game was missing: the same question
+ * lands very differently once you can point at something.
+ */
+function confrontationInstruction(npcId: NPCId, clueId: string): string {
+  const clue = CLUE_BY_ID[clueId];
+  if (!clue) return '';
+
+  const ownsIt = clue.revealedBy === npcId;
+  const isCulprit = npcId === CULPRIT;
+  const aboutThem = clue.text.toLowerCase().includes(NPC_BY_ID[npcId].name.split(' ')[0].toLowerCase());
+
+  const lines = [
+    '',
+    `THE INVESTIGATOR HAS JUST PUT THIS TO YOU DIRECTLY: "${clue.text}"`,
+    'React to this specific fact. Do not ignore it and do not change the subject cleanly.'
+  ];
+
+  if (isCulprit && aboutThem) {
+    lines.push(
+      'This is about you and it is true. Stay charming but let one crack show - a pause, an over-explanation, a detail nobody asked for. Do not confess.'
+    );
+  } else if (isCulprit) {
+    lines.push(
+      'Redirect this somewhere useful to you. Be helpful and specific about someone else, without ever sounding accusatory.'
+    );
+  } else if (aboutThem) {
+    lines.push('This makes you look bad and you know it. Get defensive, explain too much, and be visibly rattled.');
+  } else if (ownsIt) {
+    lines.push('You are the one who knows about this. Confirm it and add one detail you have not mentioned before.');
+  } else {
+    lines.push(
+      'This is news to you. React honestly, then connect it to something you personally saw or heard today.'
+    );
+  }
+
+  return lines.join('\n');
+}
+
 function buildSystemPrompt(params: {
   npcId: NPCId;
   npcMemory: string;
@@ -91,6 +147,7 @@ function buildSystemPrompt(params: {
   priorConversation: string;
   specificConversationContext: string;
   behaviorAddendum: string;
+  confrontation?: string;
 }) {
   const npc = NPC_BY_ID[params.npcId];
   return [
@@ -102,6 +159,7 @@ function buildSystemPrompt(params: {
     `Exact recalled conversation with named coworkers: ${params.specificConversationContext || '(no exact named-coworker conversation surfaced)'}`,
     `Your secret - never state this directly, only hint if player asks exactly the right thing: ${npc.secret}`,
     params.behaviorAddendum,
+    params.confrontation,
     '',
     'A golden USB drive was stolen from the CEO\'s office this morning.',
     'You have your own theory, colored by your personality and what you know.',
@@ -225,6 +283,10 @@ export async function POST(req: Request) {
     const gameTime = body.gameTime ?? '09:00';
     const playerLocation = body.playerLocation ?? 'office';
 
+    // Seeding is deduped process-wide, so this is a no-op after the first request.
+    // It is not awaited - the first player message should not wait on eight ingests.
+    void ensureBackstorySeeded().catch(() => {});
+
     // Build context before HydraDB calls — client already sends cluesFound and
     // investigationState so we don't need to wait for the hive fetch.
     const additionalContext = buildAdditionalContext(
@@ -242,35 +304,46 @@ export async function POST(req: Request) {
     let investigationFromHive: InvestigationState = { npcIdsTalkedTo: [], cluesFound: [] };
 
     try {
-      await ensureBackstorySeeded();
-      npcMemoryLines = await recallNpcMemory(body.npcId, body.playerMessage, additionalContext);
-      worldContextLines = await recallHive(body.playerMessage, additionalContext);
-
-      // Lexical recall runs in parallel when the player mentions clue-related words.
-      // Results are prepended so exact matches rank ahead of semantic approximations.
-      if (clueKeywords.length > 0) {
-        const lexicalLines = await recallHiveLexical(clueKeywords).catch(() => []);
-        worldContextLines = uniqueLines([...lexicalLines, ...worldContextLines]);
-      }
-      priorConversationHistory = await getPlayerConversationHistory(body.npcId);
-      investigationFromHive = await getInvestigationState();
-
+      // Everything below reads from HydraDB and nothing depends on anything else,
+      // so it all goes out at once. This used to be five-plus sequential awaits,
+      // which meant the player waited for every round trip end to end before the
+      // LLM was even called. Each read is individually timed out and defaulted so
+      // one slow lookup degrades the context instead of stalling the reply.
       const mentionedNpcIds = extractMentionedNpcIds(body.playerMessage, body.npcId);
-      if (mentionedNpcIds.length > 0) {
-        const targetedRecallResults = await Promise.all(
-          mentionedNpcIds.flatMap((mentionedNpcId) => {
-            const currentNpcName = NPC_BY_ID[body.npcId].name;
-            const mentionedNpcName = NPC_BY_ID[mentionedNpcId].name;
-            const exactQuery = `${currentNpcName} conversation with ${mentionedNpcName}`;
+      const currentNpcName = NPC_BY_ID[body.npcId].name;
 
-            return [
-              recallNpcMemory(body.npcId, exactQuery).catch(() => []),
-              recallHive(exactQuery).catch(() => [])
-            ];
-          })
-        );
+      const [
+        npcMemoryResult,
+        hiveResult,
+        lexicalResult,
+        historyResult,
+        investigationResult,
+        ...targetedResults
+      ] = await Promise.all([
+        withTimeout(recallNpcMemory(body.npcId, body.playerMessage, additionalContext), [] as string[]),
+        withTimeout(recallHive(body.playerMessage, additionalContext), [] as string[]),
+        clueKeywords.length > 0
+          ? withTimeout(recallHiveLexical(clueKeywords), [] as string[])
+          : Promise.resolve([] as string[]),
+        withTimeout(getPlayerConversationHistory(body.npcId), [] as PersistedChatMessage[]),
+        withTimeout(getInvestigationState(), { npcIdsTalkedTo: [], cluesFound: [] } as InvestigationState),
+        ...mentionedNpcIds.flatMap((mentionedNpcId) => {
+          const exactQuery = `${currentNpcName} conversation with ${NPC_BY_ID[mentionedNpcId].name}`;
+          return [
+            withTimeout(recallNpcMemory(body.npcId, exactQuery), [] as string[]),
+            withTimeout(recallHive(exactQuery), [] as string[])
+          ];
+        })
+      ]);
 
-        specificConversationLines = uniqueLines(targetedRecallResults.flat());
+      npcMemoryLines = npcMemoryResult;
+      // Lexical hits are prepended so exact keyword matches outrank semantic ones.
+      worldContextLines = uniqueLines([...lexicalResult, ...hiveResult]);
+      priorConversationHistory = historyResult;
+      investigationFromHive = investigationResult;
+
+      if (targetedResults.length > 0) {
+        specificConversationLines = uniqueLines(targetedResults.flat());
         npcMemoryLines = uniqueLines([...specificConversationLines, ...npcMemoryLines]);
         worldContextLines = uniqueLines([...specificConversationLines, ...worldContextLines]);
       }
@@ -292,17 +365,114 @@ export async function POST(req: Request) {
       worldContext: worldContextLines.slice(0, 4).join(' | '),
       priorConversation: formatPriorConversation(priorConversationHistory),
       specificConversationContext: specificConversationLines.slice(0, 4).join(' | '),
-      behaviorAddendum
+      behaviorAddendum,
+      confrontation: body.presentedClue ? confrontationInstruction(body.npcId, body.presentedClue) : undefined
     });
 
+    const history = toLLMHistory(body.conversationHistory);
+    const historyForLLM: LLMMessage[] =
+      history.length > 0 && history[history.length - 1]?.content === body.playerMessage
+        ? history
+        : [...history, { role: 'user', content: body.playerMessage }];
+
+    // Everything that has to happen once the full reply text exists, shared by
+    // the streaming and non-streaming paths.
+    const finalize = (npcText: string) => {
+      const emotion = detectEmotion(npcText);
+      const clueFound = detectClueInReply({
+        npcId: body.npcId,
+        replyText: npcText,
+        alreadyFound: cluesFound
+      });
+
+      const persistedConversation: PersistedChatMessage[] = [
+        ...(body.conversationHistory ?? []).map((message) => ({
+          role: message.role,
+          text: message.text
+        })),
+        { role: 'npc', text: npcText }
+      ];
+
+      // Persist in the background. The player already has their reply; waiting for
+      // three more HydraDB writes before returning only made the UI feel slower.
+      void Promise.allSettled([
+        savePlayerConversation({
+          npcId: body.npcId,
+          messages: persistedConversation,
+          gameTime,
+          location: playerLocation
+        }),
+        ingestHiveEvent(
+          {
+            description: `Player spoke with ${npc.name} at ${playerLocation}. Player said: "${body.playerMessage}". ${npc.name} replied: "${npcText}"`,
+            entities: ['player', body.npcId],
+            gameTime,
+            location: playerLocation,
+            isClue: !!clueFound,
+            clueId: clueFound ?? undefined
+          },
+          true
+        ),
+        clueFound && !cluesFound.includes(clueFound)
+          ? setInvestigationState({
+              npcIdsTalkedTo: investigationFromHive.npcIdsTalkedTo.includes(body.npcId)
+                ? investigationFromHive.npcIdsTalkedTo
+                : [...investigationFromHive.npcIdsTalkedTo, body.npcId],
+              cluesFound: [...cluesFound, clueFound]
+            })
+          : Promise.resolve()
+      ]).catch(() => {});
+
+      return { emotion, clueFound };
+    };
+
+    // ── Streaming path ───────────────────────────────────────────────────────
+    // Sends each fragment as it arrives so the first words land on screen in a
+    // few hundred milliseconds instead of after the whole reply is generated.
+    if (body.stream) {
+      const encoder = new TextEncoder();
+      const sse = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const send = (payload: unknown) => {
+            controller.enqueue(encoder.encode('data: ' + JSON.stringify(payload) + SSE_FRAME_END));
+          };
+
+          let npcText = '';
+          try {
+            for await (const piece of streamLLM(systemPrompt, historyForLLM)) {
+              npcText += piece;
+              send({ type: 'delta', text: piece });
+            }
+          } catch {
+            // Fall through with whatever arrived before the failure.
+          }
+
+          if (!npcText.trim()) {
+            send({ type: 'done', npcText: '[CONNECTION ERROR]', emotion: 'neutral', clueFound: null, knowledgeLinks: [] });
+            controller.close();
+            return;
+          }
+
+          const { emotion, clueFound } = finalize(npcText);
+          send({ type: 'done', npcText, emotion, clueFound, knowledgeLinks });
+          controller.close();
+        }
+      });
+
+      return new Response(sse, {
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          // Stops proxies (and Netlify) from buffering the stream.
+          'X-Accel-Buffering': 'no'
+        }
+      });
+    }
+
+    // ── Non-streaming path ───────────────────────────────────────────────────
     let npcText = '';
     try {
-      const history = toLLMHistory(body.conversationHistory);
-      const historyForLLM: LLMMessage[] =
-        history.length > 0 && history[history.length - 1]?.content === body.playerMessage
-          ? history
-          : [...history, { role: 'user', content: body.playerMessage }];
-
       npcText = await callLLM(systemPrompt, historyForLLM);
     } catch {
       return NextResponse.json({
@@ -312,52 +482,7 @@ export async function POST(req: Request) {
       });
     }
 
-    const emotion = detectEmotion(npcText);
-    const clueFound = detectClueInReply({
-      npcId: body.npcId,
-      replyText: npcText,
-      alreadyFound: cluesFound
-    });
-
-    try {
-      const persistedConversation: PersistedChatMessage[] = [
-        ...(body.conversationHistory ?? []).map((message) => ({
-          role: message.role,
-          text: message.text
-        })),
-        { role: 'npc', text: npcText }
-      ];
-
-      await savePlayerConversation({
-        npcId: body.npcId,
-        messages: persistedConversation,
-        gameTime,
-        location: playerLocation
-      });
-
-      await ingestHiveEvent(
-        {
-          description: `Player spoke with ${npc.name} at ${playerLocation}. Player said: "${body.playerMessage}". ${npc.name} replied: "${npcText}"`,
-          entities: ['player', body.npcId],
-          gameTime,
-          location: playerLocation,
-          isClue: !!clueFound,
-          clueId: clueFound ?? undefined
-        },
-        true
-      );
-
-      if (clueFound && !cluesFound.includes(clueFound)) {
-        await setInvestigationState({
-          npcIdsTalkedTo: investigationFromHive.npcIdsTalkedTo.includes(body.npcId)
-            ? investigationFromHive.npcIdsTalkedTo
-            : [...investigationFromHive.npcIdsTalkedTo, body.npcId],
-          cluesFound: [...cluesFound, clueFound]
-        });
-      }
-    } catch {
-      // ignore ingest failures
-    }
+    const { emotion, clueFound } = finalize(npcText);
 
     return NextResponse.json({
       npcText,

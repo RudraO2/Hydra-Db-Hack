@@ -11,6 +11,9 @@ import type { Emotion } from '@/lib/VRMAnimation';
 
 type Message = { role: 'npc' | 'player'; text: string };
 
+// Server-sent events separate frames with a blank line.
+const SSE_SEPARATOR = String.fromCharCode(10, 10);
+
 const OPENING_STATE: Record<NPCId, { emotion: Emotion; text: string }> = {
   kabir: {
     emotion: 'angry',
@@ -52,6 +55,9 @@ export default function ConversationView() {
   const addConversationEvent = useStore((s) => s.addConversationEvent);
   const addKnowledgeEdge = useStore((s) => s.addKnowledgeEdge);
   const cluesFound = useStore((s) => s.cluesFound);
+  const recordClueSource = useStore((s) => s.recordClueSource);
+  const markCluePresented = useStore((s) => s.markCluePresented);
+  const presentedClues = useStore((s) => s.presentedClues);
   const investigationState = useStore((s) => s.investigationState);
   const gameTimeMinutes = useStore((s) => s.gameTimeMinutes);
   const playerLocation = useStore((s) => s.playerLocation);
@@ -64,9 +70,11 @@ export default function ConversationView() {
   const [isListening, setIsListening] = useState(false);
   const [draft, setDraft] = useState('');
   const [clueToast, setClueToast] = useState<string | null>(null);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!npc) return;
@@ -146,7 +154,12 @@ export default function ConversationView() {
     [messages]
   );
 
-  async function handleSend(textOverride?: string) {
+  /**
+   * Streams the reply. The first fragment usually lands within a few hundred
+   * milliseconds, so the character starts talking while the rest is still being
+   * generated instead of the panel sitting on "thinking" for the whole trip.
+   */
+  async function handleSend(textOverride?: string, presentedClue?: string) {
     if (!npc) return;
     const playerText = (textOverride ?? draft).trim();
     if (!playerText) return;
@@ -156,40 +169,44 @@ export default function ConversationView() {
     setDraft('');
     setIsLoading(true);
 
-    try {
-      const res = await fetch('/api/npc/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          npcId: npc.id,
-          playerMessage: playerText,
-          conversationHistory: history,
-          gameTime: formatGameTime(gameTimeMinutes),
-          investigationState,
-          cluesFound,
-          playerLocation
-        })
+    // The streaming reply occupies its own message slot, appended to as deltas arrive.
+    let replyIndex = -1;
+    setMessages((prev) => {
+      replyIndex = prev.length;
+      return [...prev, { role: 'npc', text: '' }];
+    });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let fullText = '';
+
+    const applyDone = (payload: {
+      npcText?: string;
+      emotion?: Emotion;
+      clueFound?: string | null;
+      knowledgeLinks?: Array<{ from: string; to: string; label: string }>;
+    }) => {
+      const finalText = payload.npcText ?? fullText;
+      setMessages((prev) => {
+        const next = [...prev];
+        if (next[replyIndex]) next[replyIndex] = { role: 'npc', text: finalText };
+        return next;
       });
+      setCurrentEmotion(payload.emotion ?? 'neutral');
 
-      const payload = await res.json().catch(() => ({}));
-      const npcText: string = payload?.npcText ?? '[CONNECTION ERROR]';
-      const emotion: Emotion = (payload?.emotion as Emotion) ?? 'neutral';
-      const clueFound: string | null = payload?.clueFound ?? null;
-      const knowledgeLinks: Array<{ from: string; to: string; label: string }> = Array.isArray(payload?.knowledgeLinks)
-        ? payload.knowledgeLinks
-        : [];
-
-      setMessages((prev) => [...prev, { role: 'npc', text: npcText }]);
-      setCurrentEmotion(emotion);
-
-      if (clueFound) {
-        addClue(clueFound);
-        const clueText = CLUE_BY_ID[clueFound]?.text ?? clueFound;
-        setClueToast(clueText);
-        window.setTimeout(() => setClueToast(null), 3000);
+      if (payload.clueFound) {
+        addClue(payload.clueFound);
+        recordClueSource({
+          clueId: payload.clueFound,
+          npcId: npc.id,
+          gameTime: formatGameTime(gameTimeMinutes)
+        });
+        setClueToast(CLUE_BY_ID[payload.clueFound]?.text ?? payload.clueFound);
+        window.setTimeout(() => setClueToast(null), 3600);
       }
 
-      for (const link of knowledgeLinks) {
+      for (const link of payload.knowledgeLinks ?? []) {
         addConversationEvent(`${link.from}:${link.to}`);
         addKnowledgeEdge({
           id: `memory:${link.from}:${link.to}:${link.label}`,
@@ -200,29 +217,99 @@ export default function ConversationView() {
         });
       }
 
-      if (knowledgeLinks.length > 0) {
-        console.log('[Hydra Flow] Memory chain surfaced in NPC chat', {
+      return finalText;
+    };
+
+    try {
+      const res = await fetch('/api/npc/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
           npcId: npc.id,
-          knowledgeLinks
-        });
+          playerMessage: playerText,
+          conversationHistory: history,
+          gameTime: formatGameTime(gameTimeMinutes),
+          investigationState,
+          cluesFound,
+          playerLocation,
+          presentedClue,
+          stream: true
+        })
+      });
+
+      if (!res.ok || !res.body) throw new Error('chat request failed');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let spoken = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split(SSE_SEPARATOR);
+        buffer = frames.pop() ?? '';
+
+        for (const frame of frames) {
+          const line = frame.trim();
+          if (!line.startsWith('data:')) continue;
+
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(line.slice(5).trim());
+          } catch {
+            continue;
+          }
+
+          if (payload.type === 'delta' && typeof payload.text === 'string') {
+            fullText += payload.text;
+            const snapshot = fullText;
+            setMessages((prev) => {
+              const next = [...prev];
+              if (next[replyIndex]) next[replyIndex] = { role: 'npc', text: snapshot };
+              return next;
+            });
+            // The avatar should be talking while the words appear, not after.
+            if (fullText.length - spoken.length > 24) {
+              spoken = fullText;
+              setIsLoading(false);
+            }
+          } else if (payload.type === 'done') {
+            const finalText = applyDone(payload as Parameters<typeof applyDone>[0]);
+            void userSpeak(finalText, { npcId: npc.id }).catch(() => {});
+          }
+        }
       }
 
-      try {
-        await userSpeak(npcText, { npcId: npc.id });
-      } catch {
-        // TTS is optional.
-      }
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        { role: 'npc', text: '[CONNECTION ERROR]' }
-      ]);
-    } finally {
-      setIsLoading(false);
-      window.requestAnimationFrame(() => {
-        inputRef.current?.focus();
+      if (!fullText.trim()) throw new Error('empty reply');
+    } catch (error) {
+      if ((error as Error).name === 'AbortError') return;
+      setMessages((prev) => {
+        const next = [...prev];
+        if (next[replyIndex] && !next[replyIndex].text) {
+          next[replyIndex] = { role: 'npc', text: '[CONNECTION ERROR]' };
+        }
+        return next;
       });
+    } finally {
+      abortRef.current = null;
+      setIsLoading(false);
+      window.requestAnimationFrame(() => inputRef.current?.focus());
     }
+  }
+
+  /** Puts a piece of established evidence to this character directly. */
+  async function handlePresentClue(clueId: string) {
+    if (!npc || isLoading) return;
+    const clue = CLUE_BY_ID[clueId];
+    if (!clue) return;
+
+    setEvidenceOpen(false);
+    markCluePresented(npc.id, clueId);
+    await handleSend(`I need you to explain something. ${clue.text}`, clueId);
   }
 
   async function handleMic() {
@@ -242,6 +329,10 @@ export default function ConversationView() {
   }
 
   function handleClose() {
+    // Walking away should stop the reply mid-sentence, not leave it streaming
+    // into a panel nobody is looking at.
+    abortRef.current?.abort();
+    abortRef.current = null;
     if (activeNPC) {
       worldEvents.emit('npc:conversation_end', { npcId: activeNPC });
     }
@@ -390,6 +481,75 @@ export default function ConversationView() {
             </div>
           ) : null}
         </div>
+
+        {/* Evidence drawer — putting a fact to someone plays very differently
+            from asking about it, so it is its own action. */}
+        {cluesFound.length > 0 ? (
+          <div style={{ marginBottom: 10 }}>
+            <button
+              type="button"
+              onClick={() => setEvidenceOpen((open) => !open)}
+              disabled={isLoading}
+              style={{
+                width: '100%',
+                padding: '9px 13px',
+                borderRadius: 9,
+                border: '1px solid rgba(243,182,64,0.32)',
+                background: evidenceOpen ? 'rgba(243,182,64,0.16)' : 'rgba(243,182,64,0.07)',
+                color: '#f3b640',
+                fontSize: 12.5,
+                fontWeight: 700,
+                letterSpacing: '0.03em',
+                cursor: isLoading ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}
+            >
+              <span>Present evidence</span>
+              <span style={{ opacity: 0.65, fontWeight: 500 }}>
+                {cluesFound.length} on file {evidenceOpen ? '▾' : '▸'}
+              </span>
+            </button>
+
+            {evidenceOpen ? (
+              <div style={{ display: 'grid', gap: 6, marginTop: 8, maxHeight: 168, overflowY: 'auto' }}>
+                {cluesFound.map((clueId) => {
+                  const clue = CLUE_BY_ID[clueId];
+                  if (!clue) return null;
+                  const alreadyShown = (presentedClues[npc.id] ?? []).includes(clueId);
+
+                  return (
+                    <button
+                      key={clueId}
+                      type="button"
+                      disabled={isLoading}
+                      onClick={() => void handlePresentClue(clueId)}
+                      style={{
+                        textAlign: 'left',
+                        padding: '9px 11px',
+                        borderRadius: 8,
+                        border: '1px solid rgba(255,255,255,0.1)',
+                        background: 'rgba(255,255,255,0.04)',
+                        color: alreadyShown ? 'rgba(244,246,251,0.42)' : '#f4f6fb',
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        cursor: isLoading ? 'not-allowed' : 'pointer'
+                      }}
+                    >
+                      {clue.shortLabel}
+                      {alreadyShown ? (
+                        <span style={{ display: 'block', fontSize: 10, opacity: 0.6, marginTop: 3 }}>
+                          already put to {npc.name.split(' ')[0]}
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         {/* Input row */}
         <form

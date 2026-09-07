@@ -10,6 +10,17 @@ function getServerEnv(name: string) {
   return process.env[name];
 }
 
+export const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS ?? 12_000);
+
+// Some Groq models (qwen) emit a <think> preamble in the content field.
+// Strip it so the player never sees the model reasoning out loud.
+function stripReasoning(text: string): string {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<\/?think>/gi, '')
+    .trim();
+}
+
 function resolveProvider(): SupportedLLMProvider {
   const configured = (getServerEnv('LLM_PROVIDER') ?? 'auto').toLowerCase();
   if (configured === 'groq' || configured === 'gemini') return configured;
@@ -29,12 +40,16 @@ function extractTextFromGemini(payload: any): string {
   return text.trim();
 }
 
+// gpt-oss is a reasoning model. reasoning_effort 'low' keeps the private thinking
+// budget small, which is what makes it answer in ~500ms instead of ~1.5s. The
+// separate `reasoning` field it returns is never shown to the player.
+const GROQ_DEFAULT_MODEL = 'openai/gpt-oss-20b';
+
 async function callGroq(system: string, messages: Message[]): Promise<string> {
   const apiKey = getServerEnv('GROQ_API_KEY');
-  const model = getServerEnv('GROQ_MODEL');
+  const model = getServerEnv('GROQ_MODEL') || GROQ_DEFAULT_MODEL;
 
   if (!apiKey) throw new Error('GROQ_API_KEY is not configured.');
-  if (!model) throw new Error('GROQ_MODEL is not configured.');
 
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
@@ -42,10 +57,12 @@ async function callGroq(system: string, messages: Message[]): Promise<string> {
       'content-type': 'application/json',
       authorization: `Bearer ${apiKey}`
     },
+    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     body: JSON.stringify({
       model,
-      temperature: 0.7,
-      max_completion_tokens: 300,
+      temperature: 0.85,
+      max_completion_tokens: 400,
+      reasoning_effort: 'low',
       messages: [
         { role: 'system', content: system },
         ...messages
@@ -59,19 +76,20 @@ async function callGroq(system: string, messages: Message[]): Promise<string> {
   }
 
   const text = payload?.choices?.[0]?.message?.content;
-  if (typeof text !== 'string' || !text.trim()) {
+  if (typeof text !== 'string' || !stripReasoning(text)) {
     throw new Error('Groq returned no text content.');
   }
 
-  return text.trim();
+  return stripReasoning(text);
 }
+
+const GEMINI_DEFAULT_MODEL = 'gemini-3.5-flash';
 
 async function callGemini(system: string, messages: Message[]): Promise<string> {
   const apiKey = getServerEnv('GEMINI_API_KEY');
-  const model = getServerEnv('GEMINI_MODEL');
+  const model = getServerEnv('GEMINI_MODEL') || GEMINI_DEFAULT_MODEL;
 
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured.');
-  if (!model) throw new Error('GEMINI_MODEL is not configured.');
 
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -81,6 +99,7 @@ async function callGemini(system: string, messages: Message[]): Promise<string> 
         'content-type': 'application/json',
         'x-goog-api-key': apiKey
       },
+      signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
       body: JSON.stringify({
         system_instruction: {
           parts: [{ text: system }]
@@ -90,8 +109,10 @@ async function callGemini(system: string, messages: Message[]): Promise<string> 
           parts: [{ text: message.content }]
         })),
         generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 300
+          temperature: 0.85,
+          maxOutputTokens: 400,
+          // No visible thinking for in-character dialogue - it only adds latency.
+          thinkingConfig: { thinkingBudget: 0 }
         }
       })
     }
@@ -102,7 +123,7 @@ async function callGemini(system: string, messages: Message[]): Promise<string> 
     throw new Error(`Gemini request failed: ${payload?.error?.message ?? response.statusText}`);
   }
 
-  return extractTextFromGemini(payload);
+  return stripReasoning(extractTextFromGemini(payload));
 }
 
 export async function callLLM(system: string, messages: Message[]): Promise<string> {
@@ -135,6 +156,168 @@ export async function callLLM(system: string, messages: Message[]): Promise<stri
   }
 
   throw new Error(`No LLM provider succeeded. ${errors.join(' | ')}`);
+}
+
+// ─── Streaming ───────────────────────────────────────────────────────────────
+// Streaming is what makes conversation feel instant. Waiting for a complete
+// reply means a blank "thinking" pane for the full round trip; streaming puts
+// the first words on screen in a few hundred milliseconds.
+
+async function* streamGroq(system: string, messages: Message[]): AsyncGenerator<string> {
+  const apiKey = getServerEnv('GROQ_API_KEY');
+  const model = getServerEnv('GROQ_MODEL') || GROQ_DEFAULT_MODEL;
+  if (!apiKey) throw new Error('GROQ_API_KEY is not configured.');
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${apiKey}`
+    },
+    signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    body: JSON.stringify({
+      model,
+      temperature: 0.85,
+      max_completion_tokens: 400,
+      reasoning_effort: 'low',
+      stream: true,
+      messages: [{ role: 'system', content: system }, ...messages]
+    })
+  });
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Groq stream failed: ${response.status} ${detail.slice(0, 200)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let emittedAnything = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+
+      try {
+        const chunk = JSON.parse(data);
+        const delta = chunk?.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta) {
+          emittedAnything = true;
+          yield delta;
+        }
+      } catch {
+        // Ignore partial or malformed SSE frames.
+      }
+    }
+  }
+
+  if (!emittedAnything) throw new Error('Groq stream produced no content.');
+}
+
+async function* streamGemini(system: string, messages: Message[]): AsyncGenerator<string> {
+  const apiKey = getServerEnv('GEMINI_API_KEY');
+  const model = getServerEnv('GEMINI_MODEL') || GEMINI_DEFAULT_MODEL;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured.');
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: system }] },
+        contents: messages.map((message) => ({
+          role: message.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: message.content }]
+        })),
+        generationConfig: {
+          temperature: 0.85,
+          maxOutputTokens: 400,
+          thinkingConfig: { thinkingBudget: 0 }
+        }
+      })
+    }
+  );
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Gemini stream failed: ${response.status} ${detail.slice(0, 200)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data) continue;
+
+      try {
+        const chunk = JSON.parse(data);
+        const text = chunk?.candidates?.[0]?.content?.parts
+          ?.map((part: any) => part?.text)
+          .filter(Boolean)
+          .join('');
+        if (text) yield text;
+      } catch {
+        // Ignore partial frames.
+      }
+    }
+  }
+}
+
+/**
+ * Yields reply fragments as the model produces them. Falls back to the other
+ * provider, and finally to a single non-streamed call, so a streaming failure
+ * degrades to the old behaviour rather than breaking the conversation.
+ */
+export async function* streamLLM(system: string, messages: Message[]): AsyncGenerator<string> {
+  if (typeof window !== 'undefined') {
+    throw new Error('streamLLM must run on the server.');
+  }
+
+  const provider = resolveProvider();
+  const order =
+    provider === 'gemini' ? [streamGemini] : provider === 'groq' ? [streamGroq] : [streamGroq, streamGemini];
+
+  for (let index = 0; index < order.length; index += 1) {
+    const generator = order[index];
+    try {
+      let produced = false;
+      for await (const piece of generator(system, messages)) {
+        produced = true;
+        yield piece;
+      }
+      if (produced) return;
+    } catch {
+      // Try the next provider.
+    }
+  }
+
+  // Last resort: a normal blocking call, delivered as one chunk.
+  yield await callLLM(system, messages);
 }
 
 // Track the active audio so a new line cancels the previous one.

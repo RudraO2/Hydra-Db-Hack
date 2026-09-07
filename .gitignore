@@ -10,3 +10,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Local scratch from the asset-import phase
+_tmp_gen_agents/
+_tmp_genagents_code/
+office-drama/
+tsconfig.tsbuildinfo
+
+# Duplicate source VRMs — the served copies live in public/vrm
+Sample A.vrm
+Sample B.vrm
+Sample C.vrm

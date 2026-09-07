@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-// Voice mapping per NPC — Groq Orpheus voices
+// Voice mapping per NPC. Orpheus only accepts these six voices:
+// autumn, diana, hannah (female) and austin, daniel, troy (male).
+// The previous mapping used names the API rejects, so every line failed silently.
 const NPC_VOICE: Record<string, string> = {
-  kabir: 'leo',    // Deep, authoritative male
-  priya: 'tara',   // Warm, upbeat female
-  dev: 'dan',      // Neutral, slightly nerdy male
-  meera: 'leah',   // Sharp, cool female
-  sanjana: 'mia',  // Composed, professional female
-  rohan: 'zac',    // Energetic, young male
+  kabir: 'troy',      // Deep, authoritative male
+  priya: 'autumn',    // Warm, upbeat female
+  dev: 'daniel',      // Neutral, slightly nerdy male
+  meera: 'diana',     // Sharp, cool female
+  sanjana: 'hannah',  // Composed, professional female
+  rohan: 'austin',    // Energetic, young male
 };
-const DEFAULT_VOICE = 'tara';
+const DEFAULT_VOICE = 'autumn';
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));

@@ -1,13 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import GameCanvas from '@/components/GameCanvas';
 import ConversationView from '@/components/ConversationView';
 import GossipTicker from '@/components/GossipTicker';
 import MemoryWeb from '@/components/MemoryWeb';
+import CaseFile from '@/components/CaseFile';
+import EndingSequence from '@/components/EndingSequence';
+import GameHUD from '@/components/GameHUD';
 import { NPC_BY_ID, NPCS } from '@/data/npcs';
 import { useStore } from '@/lib/store';
+import { prefetchAllVRMs } from '@/lib/vrmCache';
 import { useGameStore } from '@/store/gameStore';
 import { worldEvents } from '@/game/worldEvents';
 
@@ -38,18 +42,22 @@ function isEditableTarget(target: EventTarget | null) {
 }
 
 const CONTROL_HINTS = [
-  { key: 'WASD / Arrows', label: 'Move' },
+  { key: 'WASD', label: 'Move' },
   { key: 'E', label: 'Talk' },
-  { key: 'ESC', label: 'Close' },
+  { key: 'J', label: 'Case File' },
   { key: 'M', label: 'Memory Web' },
-  { key: 'D', label: 'Debug' },
+  { key: 'ESC', label: 'Close' },
 ];
+
+// 6:00 PM. The working day is the timer.
+const DAY_END_MINUTES = 18 * 60;
 
 export default function GamePage() {
   const [npcInRange, setNpcInRange] = useState<string | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugNote, setDebugNote] = useState<string | null>(null);
   const [memoryWebOpen, setMemoryWebOpen] = useState(false);
+  const [caseFileOpen, setCaseFileOpen] = useState(false);
   const [hydraInspectorOpen, setHydraInspectorOpen] = useState(false);
   const [hydraInspectorFilter, setHydraInspectorFilter] = useState('');
   const [hydraInspectorData, setHydraInspectorData] = useState<HydraInspectorSnapshot>({
@@ -67,6 +75,9 @@ export default function GamePage() {
   const addConversationEvent = useStore((state) => state.addConversationEvent);
   const knowledgeEdges = useStore((state) => state.knowledgeEdges);
   const addKnowledgeEdge = useStore((state) => state.addKnowledgeEdge);
+  const markTalkedTo = useStore((state) => state.markTalkedTo);
+  const accusation = useStore((state) => state.accusation);
+  const setAccusation = useStore((state) => state.setAccusation);
   const lastEvents = useGameStore((state) => state.lastEvents);
   const appendLastEvent = useGameStore((state) => state.appendLastEvent);
   const appendLastEvents = useGameStore((state) => state.appendLastEvents);
@@ -122,6 +133,12 @@ export default function GamePage() {
     return () => window.clearInterval(interval);
   }, []);
 
+  // Warm the avatar cache during idle time so the first conversation opens
+  // instantly instead of downloading a model while the player waits.
+  useEffect(() => {
+    prefetchAllVRMs();
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
@@ -153,23 +170,41 @@ export default function GamePage() {
         return;
       }
 
-      if (event.key.toLowerCase() === 'd') setDebugOpen((open) => !open);
-      if (event.key.toLowerCase() === 'm') setMemoryWebOpen((open) => !open);
+      const key = event.key.toLowerCase();
+      if (key === 'd') setDebugOpen((open) => !open);
+      if (key === 'm') setMemoryWebOpen((open) => !open);
+      if (key === 'j') setCaseFileOpen((open) => !open);
+      if (key === 'escape') {
+        setCaseFileOpen(false);
+        setMemoryWebOpen(false);
+      }
     };
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [activeNPC, hydraInspectorOpen, loadHydraInspector]);
 
+  // gameTimeMinutes ticks every second and npcPositions changes every two, so
+  // listing them as dependencies tore the interval down and rebuilt it before it
+  // could ever reach GOSSIP_INTERVAL_MS - gossip never actually ran. The live
+  // values are read through a ref instead, and the interval is created once.
+  const gossipInputsRef = useRef({ npcPositions, gameTimeMinutes });
+  gossipInputsRef.current = { npcPositions, gameTimeMinutes };
+
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      void (async () => {
+    let inFlight = false;
+
+    const runGossip = async () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
+      try {
+        const { npcPositions: positions, gameTimeMinutes: minutes } = gossipInputsRef.current;
         const response = await fetch('/api/npc/gossip', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            npcPositions,
-            gameTime: formatGameTime(gameTimeMinutes)
+            npcPositions: positions,
+            gameTime: formatGameTime(minutes)
           })
         });
 
@@ -193,11 +228,14 @@ export default function GamePage() {
           label: `${payload.topic}`,
           kind: 'gossip'
         });
-      })();
-    }, GOSSIP_INTERVAL_MS);
+      } finally {
+        inFlight = false;
+      }
+    };
 
+    const interval = window.setInterval(() => void runGossip(), GOSSIP_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [addConversationEvent, addGossipSession, addKnowledgeEdge, gameTimeMinutes, npcPositions]);
+  }, [addConversationEvent, addGossipSession, addKnowledgeEdge]);
 
   const handleInteract = useCallback(
     async (npcId: string) => {
@@ -205,6 +243,7 @@ export default function GamePage() {
 
       setActiveNPC(npcId);
       incrementInvestigation();
+      markTalkedTo(npcId);
       worldEvents.emit('npc:conversation_start', { npcId });
       addConversationEvent(`player:${npcId}`);
       addKnowledgeEdge({
@@ -247,8 +286,27 @@ export default function GamePage() {
       gameTimeMinutes,
       playerLocation,
       setActiveNPC,
-      incrementInvestigation
+      incrementInvestigation,
+      markTalkedTo
     ]
+  );
+
+  // Six o'clock is the deadline. If the player never commits to a name, the day
+  // ends for them and the drive leaves the building.
+  useEffect(() => {
+    if (accusation || gameTimeMinutes < DAY_END_MINUTES) return;
+    setCaseFileOpen(false);
+    setActiveNPC(null);
+    setAccusation({ suspectId: 'none', citedClues: [], endingId: 'wrong' });
+  }, [accusation, gameTimeMinutes, setAccusation, setActiveNPC]);
+
+  const handleAccuse = useCallback(
+    (result: Parameters<typeof setAccusation>[0]) => {
+      setCaseFileOpen(false);
+      setActiveNPC(null);
+      setAccusation(result);
+    },
+    [setAccusation, setActiveNPC]
   );
 
   const handleNPCProximity = useCallback((npcId: string, inRange: boolean) => {
@@ -266,6 +324,19 @@ export default function GamePage() {
       {activeNPC ? <ConversationView /> : null}
       <GossipTicker sessions={lastGossipSessions} />
       <MemoryWeb open={memoryWebOpen} edges={knowledgeEdges} />
+
+      {/* The clock lives in its own subtree so a tick does not re-render the world. */}
+      {!accusation ? <GameHUD onOpenCaseFile={() => setCaseFileOpen(true)} /> : null}
+
+      <CaseFile
+        open={caseFileOpen && !accusation}
+        onClose={() => setCaseFileOpen(false)}
+        onAccuse={handleAccuse}
+      />
+
+      {accusation ? (
+        <EndingSequence result={accusation} gameTime={formatGameTime(gameTimeMinutes)} />
+      ) : null}
 
       {/* Back to menu */}
       <Link

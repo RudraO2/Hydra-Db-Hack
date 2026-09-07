@@ -20,11 +20,32 @@ export type KnowledgeEdge = {
   kind: 'player' | 'gossip' | 'memory';
 };
 
+/** Where a clue came from - shown in the case file so evidence has provenance. */
+export type ClueSource = {
+  clueId: string;
+  npcId: string;
+  gameTime: string;
+};
+
+export type AccusationResult = {
+  suspectId: string;
+  citedClues: string[];
+  endingId: 'caught' | 'escaped' | 'wrong';
+};
+
 type StoreState = {
   activeNPC: string | null;
   setActiveNPC: (id: string | null) => void;
   cluesFound: string[];
   addClue: (id: string) => void;
+  clueSources: ClueSource[];
+  recordClueSource: (source: ClueSource) => void;
+  presentedClues: Record<string, string[]>;
+  markCluePresented: (npcId: string, clueId: string) => void;
+  npcsTalkedTo: string[];
+  markTalkedTo: (npcId: string) => void;
+  accusation: AccusationResult | null;
+  setAccusation: (result: AccusationResult | null) => void;
   gameTimeMinutes: number;
   tickGameTime: () => void;
   playerLocation: string;
@@ -51,6 +72,27 @@ export const useStore = create<StoreState>((set) => ({
     set((state) => ({
       cluesFound: state.cluesFound.includes(id) ? state.cluesFound : [...state.cluesFound, id]
     })),
+  clueSources: [],
+  recordClueSource: (source) =>
+    set((state) => ({
+      clueSources: state.clueSources.some((entry) => entry.clueId === source.clueId)
+        ? state.clueSources
+        : [...state.clueSources, source]
+    })),
+  presentedClues: {},
+  markCluePresented: (npcId, clueId) =>
+    set((state) => {
+      const already = state.presentedClues[npcId] ?? [];
+      if (already.includes(clueId)) return state;
+      return { presentedClues: { ...state.presentedClues, [npcId]: [...already, clueId] } };
+    }),
+  npcsTalkedTo: [],
+  markTalkedTo: (npcId) =>
+    set((state) => ({
+      npcsTalkedTo: state.npcsTalkedTo.includes(npcId) ? state.npcsTalkedTo : [...state.npcsTalkedTo, npcId]
+    })),
+  accusation: null,
+  setAccusation: (result) => set({ accusation: result }),
   gameTimeMinutes: 540,
   tickGameTime: () =>
     set((state) => ({

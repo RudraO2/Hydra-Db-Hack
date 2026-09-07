@@ -10,12 +10,12 @@ const CHARACTERS = [
 ];
 
 const CONTROLS = [
-  ['WASD / Arrows', 'Move'],
-  ['E', 'Talk to NPC'],
-  ['ESC', 'End conversation'],
-  ['M', 'Memory Web'],
-  ['D', 'Debug Panel'],
-  ['Ctrl+Shift+H', 'Hydra Inspector'],
+  ['WASD', 'Move'],
+  ['E', 'Talk to someone'],
+  ['J', 'Case file / accuse'],
+  ['M', 'Memory web'],
+  ['ESC', 'Close'],
+  ['D', 'Debug panel'],
 ];
 
 const TIMELINE_PREVIEW = [

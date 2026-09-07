@@ -112,6 +112,7 @@ export class OfficeScene extends Phaser.Scene {
   private interactKey!: Phaser.Input.Keyboard.Key;
   private npcs: NPCState[] = [];
   private nearestNpcId: string | null = null;
+  private lastPlayerRoom: string | null = null;
   private map!: Phaser.Tilemaps.Tilemap;
   private gossipQueue: Array<{
     npc1Id: string;
@@ -143,18 +144,20 @@ export class OfficeScene extends Phaser.Scene {
       .map((set) => this.map.addTilesetImage(set.name, set.name))
       .filter(Boolean) as Phaser.Tilemaps.Tileset[];
 
+    // The map is 140x100 with 17 layers. Seven of those are invisible bookkeeping
+    // layers from the source tilemap; building them cost 14,000 tiles each for
+    // something that never renders, so they are skipped outright.
     let depth = 0;
     for (const layerDef of this.map.layers) {
+      const layerName = layerDef.name.toLowerCase().trim();
+      if (HIDDEN_LAYER_PATTERNS.some((pattern) => layerName.includes(pattern))) continue;
+
       const layer = this.map.createLayer(layerDef.name, tilesets, 0, 0);
       if (!layer) continue;
 
       layer.setDepth(depth++);
-
-      const layerName = layerDef.name.toLowerCase().trim();
-      const isHiddenHelperLayer = HIDDEN_LAYER_PATTERNS.some((pattern) => layerName.includes(pattern));
-      if (isHiddenHelperLayer) {
-        layer.setVisible(false);
-      }
+      // Culling keeps offscreen chunks out of the render list on a map this size.
+      layer.setSkipCull(false);
     }
 
     this.physics.world.setBounds(0, 0, this.map.widthInPixels, this.map.heightInPixels);
@@ -310,7 +313,15 @@ export class OfficeScene extends Phaser.Scene {
     }
 
     this.nearestNpcId = nearest?.id ?? null;
-    useStore.getState().setPlayerLocation(this.findRoomForPoint(this.player.x, this.player.y));
+
+    // Only write to the store when the room actually changes. Calling this every
+    // frame pushed a new state object into zustand 60 times a second and woke
+    // every React subscriber with it.
+    const currentRoom = this.findRoomForPoint(this.player.x, this.player.y);
+    if (currentRoom !== this.lastPlayerRoom) {
+      this.lastPlayerRoom = currentRoom;
+      useStore.getState().setPlayerLocation(currentRoom);
+    }
 
     if (
       Phaser.Input.Keyboard.JustDown(this.interactKey) &&
@@ -727,8 +738,14 @@ export class OfficeScene extends Phaser.Scene {
     };
   }
 
+  // Called every frame for the player and on a timer for each NPC, so it does a
+  // plain bounds test instead of allocating nine Rectangles per call.
   private findRoomForPoint(x: number, y: number) {
-    const room = ROOM_LAYOUT.find((entry) => new Phaser.Geom.Rectangle(entry.x, entry.y, entry.w, entry.h).contains(x, y));
-    return room?.name ?? 'OpenWorkspace';
+    for (const room of ROOM_LAYOUT) {
+      if (x >= room.x && x <= room.x + room.w && y >= room.y && y <= room.y + room.h) {
+        return room.name;
+      }
+    }
+    return 'OpenWorkspace';
   }
 }
