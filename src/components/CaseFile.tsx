@@ -157,7 +157,7 @@ export default function CaseFile({ open, onClose, onAccuse }: Props) {
                 </div>
               ) : (
                 <div style={{ display: 'grid', gap: 10 }}>
-                  {foundClues.map((clue) => {
+                  {foundClues.map((clue, index) => {
                     const source = sourceByClue[clue.id];
                     return (
                       <div
@@ -166,10 +166,20 @@ export default function CaseFile({ open, onClose, onAccuse }: Props) {
                           padding: '13px 15px',
                           borderRadius: 11,
                           background: 'rgba(243,182,64,0.06)',
-                          borderLeft: '3px solid #f3b640',
                           border: HAIRLINE
                         }}
                       >
+                        <div
+                          style={{
+                            fontSize: 9,
+                            letterSpacing: '0.18em',
+                            textTransform: 'uppercase',
+                            color: '#f3b640',
+                            marginBottom: 7
+                          }}
+                        >
+                          Exhibit {String(index + 1).padStart(2, '0')}
+                        </div>
                         <div style={{ fontSize: 14, lineHeight: 1.55 }}>{clue.text}</div>
                         {source ? (
                           <div style={{ fontSize: 11, opacity: 0.5, marginTop: 7 }}>

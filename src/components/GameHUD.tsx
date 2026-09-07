@@ -67,14 +67,26 @@ export default function GameHUD({ onOpenCaseFile }: { onOpenCaseFile: () => void
         >
           {formatClock(clamped)}
         </div>
-        <div style={{ height: 2, background: 'rgba(255,255,255,0.09)', borderRadius: 2, marginTop: 6 }}>
+        <div
+          style={{
+            height: 2,
+            background: 'rgba(255,255,255,0.09)',
+            borderRadius: 2,
+            marginTop: 6,
+            overflow: 'hidden'
+          }}
+        >
+          {/* Scaled rather than resized - this updates every second, and
+              animating width would relayout the HUD on every tick. */}
           <div
             style={{
               height: '100%',
-              width: `${progress * 100}%`,
+              width: '100%',
+              transform: `scaleX(${progress})`,
+              transformOrigin: 'left center',
               background: urgent ? '#e2493f' : '#f3b640',
               borderRadius: 2,
-              transition: 'width 1s linear'
+              transition: 'transform 1s linear'
             }}
           />
         </div>
